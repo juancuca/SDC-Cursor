@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Playcadia pipeline outputs (regenerated)
+Playcadia/results.csv
+Playcadia/pending.csv
+Playcadia/last_run_report.json
+Playcadia/enrich_errors.log
+
+# Optional: large catalog — uncomment if you do not want games.csv in git
+# Playcadia/games.csv
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+
+# Other local clones / payloads (not part of Playcadia)
+sdc_db/
+genie*.json
+.cursor/
+.vscode/
