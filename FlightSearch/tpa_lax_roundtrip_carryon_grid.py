@@ -2,33 +2,25 @@
 # MAGIC %md
 # MAGIC # Round-trip flight grid (carry-on–aware pricing)
 # MAGIC
-# MAGIC Searches many **(outbound departure date, return departure date)** combinations using
-# MAGIC [`flights` / `fli`](https://github.com/punitarani/fli) (unofficial Google Flights API client).
+# MAGIC Busca combinaciones **(fecha salida de ida desde origen, fecha regreso desde destino)** con
+# MAGIC [`flights` / `fli`](https://github.com/punitarani/fli). **Modos** (`SEARCH_MODE`): **`VACATION_WINDOW`**
+# MAGIC (ventana de vacaciones + días de viaje) y **`DEST_RETURN_DATES`** (rangos de ida y regreso desde destino,
+# MAGIC cartesiano, sin widget de duración).
 # MAGIC
-# MAGIC **Resultados por búsqueda:** para cada **par (fecha ida en origen, fecha vuelo de regreso desde destino)** se llama
-# MAGIC a la API. Antes se **descartan** pares imposibles: `MIN`/`MAX_TRIP_LENGTH_DAYS` se interpretan como días de calendario
-# MAGIC entre la salida de ida y una **llegada a casa** plausible dentro de `RETURN_ARRIVAL_HOME_*` (cruce con `rd`…`rd+2`
-# MAGIC días por vuelos que llegan tarde). Así un rango largo de salidas **no** multiplica búsquedas que nunca podrían cumplir
-# MAGIC “solo 10 días de viaje” y llegada a casa en tu ventana. **Un solo día de salida** con `MIN`…`MAX` en **7–10** y ventana
-# MAGIC de regreso estrecha puede quedar en **0–4** pares según solape, no siempre 4. Cada par ejecuta la recursión RT de **fli**:
-# MAGIC **≈ 1 + `RT_RECURSION_TOP_N` POST** a Google (ver `fli/search/flights.py`: `search(..., top_n=…)` expande idas y luego
-# MAGIC vuelta por rama). **`TOP_RESULTS_PER_SEARCH`** solo limita filas **después** de ordenar; no reduce esos POSTs.
-# MAGIC `SHOW_ALL_API_RESULTS=true` agranda la primera respuesta (más lento / 429). Entre pares hay pausa configurable
-# MAGIC (`MIN_DELAY_SEC`…`MAX_DELAY_SEC`), escalada hacia abajo si hay pocos pares.
+# MAGIC **`SORT_BY` y aerolíneas:** con **`CHEAPEST`** suele predominar lo más barato (p. ej. Frontier en rutas US).
+# MAGIC El default del widget es **`BEST`**. Para excluir aerolíneas, filtrá en Spark (`outbound_airlines_flights`, etc.).
 # MAGIC
-# MAGIC **Carry-on:** `BagsFilter(carry_on=True)` makes Google Flights **quote prices including a carry-on** so
-# MAGIC comparisons match what you pay if you need an overhead bag. It does **not** guarantee every fare
-# MAGIC includes a *complimentary* carry-on; pairing with **`exclude_basic_economy=True`** avoids many U.S.
-# MAGIC **Basic Economy** fares that often have no free carry-on.
+# MAGIC **429 y coste:** ~**1 + `RT_RECURSION_TOP_N`** POSTs por par. Pacing, retries, `SHOW_ALL`, `MAX_SEARCH_PAIRS` y
+# MAGIC `TOP_RESULTS_PER_SEARCH` son **constantes** al inicio del notebook (no widgets).
 # MAGIC
-# MAGIC **Compliance:** Unofficial API; respect Google’s terms, rate limits, and your org policy. Use only
-# MAGIC on clusters with appropriate egress. Not legal advice.
+# MAGIC **Llegada a destino:** la API usa fecha de **salida del segmento**, no “llegada a SFO el 14”; refiná con
+# MAGIC `outbound_arr_date` en Spark si hace falta.
 # MAGIC
-# MAGIC **Install note:** On PyPI the package is versioned **0.x** (e.g. `0.8.4`), not 2.x. Requires **Python ≥ 3.10**
-# MAGIC (matches current `flights` wheels; Databricks serverless is fine if the runtime is 3.10+).
+# MAGIC **Carry-on / escalas:** `BagsFilter(carry_on=True)`; **`TWO_OR_FEWER_STOPS`** fijo en código.
 # MAGIC
-# MAGIC **`typing_extensions`:** Newer `pydantic` / `fli` stacks expect **`Sentinel`** in `typing_extensions`. Databricks still
-# MAGIC ships an older copy under `/databricks/python/...` until you upgrade and **restart Python**, or imports can fail.
+# MAGIC **Compliance:** API no oficial; respetá términos de Google. Not legal advice.
+# MAGIC
+# MAGIC **Install:** `flights` 0.x; Python ≥ 3.10. Tras `%pip`, **reiniciá Python** (`typing_extensions` / `Sentinel`).
 
 # COMMAND ----------
 # MAGIC %pip install -q 'flights>=0.8.4,<0.9' 'typing_extensions>=4.15.0,<5'
@@ -73,6 +65,23 @@ from fli.models import (
 from fli.search import SearchFlights
 
 # COMMAND ----------
+# --- Tunables (no widgets): pacing, caps, fli RT recursion ---
+# Subir SHOW_ALL / RT_RECURSION_TOP_N o bajar delays aumenta 429. Ajustar aquí si hace falta.
+
+MAX_SEARCH_PAIRS = 200
+TOP_RESULTS_PER_SEARCH = 35
+RT_RECURSION_TOP_N = 6
+SHOW_ALL_API_RESULTS = False
+
+MIN_DELAY_SEC = 8.0
+MAX_DELAY_SEC = 22.0
+MAX_RETRIES = 8
+RATE_LIMIT_COOLDOWN_SEC = 90.0
+
+PAIR_HOME_ARRIVAL_SLACK_DAYS = 2
+MAX_STOPS = MaxStops.TWO_OR_FEWER_STOPS
+
+# COMMAND ----------
 # --- Databricks widgets (YYYYMMDD for dates; dropdowns for enums) ---
 
 def _w_create_text(name: str, default: str) -> None:
@@ -90,24 +99,23 @@ def _w_create_dropdown(name: str, default: str, choices: list[str]) -> None:
 
 
 def _ensure_widgets() -> None:
-    t0 = date.today()
+    _w_create_dropdown(
+        "SEARCH_MODE",
+        "VACATION_WINDOW",
+        ["VACATION_WINDOW", "DEST_RETURN_DATES"],
+    )
     _w_create_text("ORIGIN_AIRPORT", "TPA")
     _w_create_text("DESTINATION_AIRPORT", "SFO")
-    _w_create_text("OUTBOUND_DEPART_START", "20260614")
+    # VACATION_WINDOW: primer día que podés salir; último día que debés estar de vuelta en casa; duración del viaje.
+    _w_create_text("VACATION_FIRST_DAY", "20260601")
+    _w_create_text("VACATION_LAST_HOME_DAY", "20260815")
+    _w_create_dropdown("MIN_TRIP_DAYS", "10", [str(i) for i in range(1, 22)])
+    _w_create_dropdown("MAX_TRIP_DAYS", "14", [str(i) for i in range(1, 31)])
+    # DEST_RETURN_DATES: salida desde origen × regreso desde destino (sin widget de “días de duración”).
+    _w_create_text("OUTBOUND_DEPART_START", "20260613")
     _w_create_text("OUTBOUND_DEPART_END", "20260614")
-    _w_create_text("RETURN_ARRIVAL_HOME_START", "20260621")
-    _w_create_text("RETURN_ARRIVAL_HOME_END", "20260621")
-    _w_create_dropdown("MIN_TRIP_LENGTH_DAYS", "7", [str(i) for i in range(1, 22)])
-    _w_create_dropdown("MAX_TRIP_LENGTH_DAYS", "10", [str(i) for i in range(1, 31)])
-    _w_create_dropdown(
-        "MAX_API_CALLS",
-        "9999",
-        [str(i) for i in (20, 40, 60, 80, 100, 150, 200, 300, 500, 1000, 9999)],
-    )
-    _w_create_text("MIN_DELAY_SEC", "6")
-    _w_create_text("MAX_DELAY_SEC", "50")
-    _w_create_dropdown("MAX_RETRIES", "10", [str(i) for i in (3, 4, 5, 6, 8, 10)])
-    _w_create_dropdown("RATE_LIMIT_COOLDOWN_SEC", "75", [str(i) for i in (30, 45, 60, 75, 90, 120)])
+    _w_create_text("RETURN_DEPART_DEST_START", "20260622")
+    _w_create_text("RETURN_DEPART_DEST_END", "20260624")
     _w_create_dropdown("ADULTS", "1", [str(i) for i in range(1, 7)])
     _w_create_dropdown(
         "SEAT_TYPE",
@@ -115,13 +123,8 @@ def _ensure_widgets() -> None:
         ["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"],
     )
     _w_create_dropdown(
-        "MAX_STOPS",
-        "TWO_OR_FEWER_STOPS",
-        ["ANY", "NON_STOP", "ONE_STOP_OR_FEWER", "TWO_OR_FEWER_STOPS"],
-    )
-    _w_create_dropdown(
         "SORT_BY",
-        "CHEAPEST",
+        "BEST",
         [
             "TOP_FLIGHTS",
             "BEST",
@@ -133,22 +136,28 @@ def _ensure_widgets() -> None:
         ],
     )
     _w_create_dropdown("EXCLUDE_BASIC_ECONOMY", "true", ["true", "false"])
-    _w_create_dropdown(
-        "TOP_RESULTS_PER_SEARCH",
-        "30",
-        [str(i) for i in (10, 15, 20, 25, 30, 35, 40, 50)],
-    )
-    _w_create_dropdown("SHOW_ALL_API_RESULTS", "true", ["false", "true"])
     _w_create_dropdown("APPLY_TRIP_WINDOW_FILTERS", "false", ["false", "true"])
-    _w_create_dropdown(
+    _obsolete = (
+        "PRICE_CUTOFF_PERCENT",
+        "MAX_API_CALLS",
+        "MIN_DELAY_SEC",
+        "MAX_DELAY_SEC",
+        "MAX_RETRIES",
+        "RATE_LIMIT_COOLDOWN_SEC",
+        "TOP_RESULTS_PER_SEARCH",
+        "SHOW_ALL_API_RESULTS",
         "RT_RECURSION_TOP_N",
-        "8",
-        [str(i) for i in (3, 5, 6, 8, 10, 12, 15)],
+        "MAX_STOPS",
+        "MIN_TRIP_LENGTH_DAYS",
+        "MAX_TRIP_LENGTH_DAYS",
+        "RETURN_ARRIVAL_HOME_START",
+        "RETURN_ARRIVAL_HOME_END",
     )
-    try:
-        dbutils.widgets.remove("PRICE_CUTOFF_PERCENT")  # noqa: F821
-    except Exception:
-        pass
+    for _name in _obsolete:
+        try:
+            dbutils.widgets.remove(_name)  # noqa: F821
+        except Exception:
+            pass
 
 
 _ensure_widgets()
@@ -172,10 +181,6 @@ def _w_int(name: str) -> int:
     return int(_w_get(name))
 
 
-def _w_float(name: str) -> float:
-    return float(_w_get(name))
-
-
 def parse_airport_iata(widget_name: str) -> Airport:
     """Resolve a 3-letter IATA code to ``fli.models.Airport`` (bundled enum)."""
     raw = _w_get(widget_name).strip().upper().replace(" ", "")
@@ -193,31 +198,51 @@ def parse_airport_iata(widget_name: str) -> Airport:
 AIRPORT_ORIGIN = parse_airport_iata("ORIGIN_AIRPORT")
 AIRPORT_DEST = parse_airport_iata("DESTINATION_AIRPORT")
 
-# Outbound: depart **origin** on these dates (inclusive), widgets use YYYYMMDD
-OUTBOUND_DEPART_START = parse_ymd("OUTBOUND_DEPART_START")
-OUTBOUND_DEPART_END = parse_ymd("OUTBOUND_DEPART_END")
+SEARCH_MODE = _w_get("SEARCH_MODE").strip().upper().replace(" ", "_")
+if SEARCH_MODE not in ("VACATION_WINDOW", "DEST_RETURN_DATES"):
+    raise ValueError(
+        "SEARCH_MODE must be VACATION_WINDOW or DEST_RETURN_DATES, "
+        f"got {_w_get('SEARCH_MODE')!r}"
+    )
 
-# Return: **arrival back at origin (home)** calendar date in this inclusive window (YYYYMMDD)
-RETURN_ARRIVAL_HOME_START = parse_ymd("RETURN_ARRIVAL_HOME_START")
-RETURN_ARRIVAL_HOME_END = parse_ymd("RETURN_ARRIVAL_HOME_END")
-
-MIN_TRIP_LENGTH_DAYS = _w_int("MIN_TRIP_LENGTH_DAYS")
-MAX_TRIP_LENGTH_DAYS = _w_int("MAX_TRIP_LENGTH_DAYS")
-MAX_API_CALLS = _w_int("MAX_API_CALLS")
-MIN_DELAY_SEC = _w_float("MIN_DELAY_SEC")
-MAX_DELAY_SEC = _w_float("MAX_DELAY_SEC")
-MAX_RETRIES = _w_int("MAX_RETRIES")
-RATE_LIMIT_COOLDOWN_SEC = _w_float("RATE_LIMIT_COOLDOWN_SEC")
+if SEARCH_MODE == "VACATION_WINDOW":
+    VACATION_FIRST_DAY = parse_ymd("VACATION_FIRST_DAY")
+    VACATION_LAST_HOME_DAY = parse_ymd("VACATION_LAST_HOME_DAY")
+    MIN_TRIP_LENGTH_DAYS = _w_int("MIN_TRIP_DAYS")
+    MAX_TRIP_LENGTH_DAYS = _w_int("MAX_TRIP_DAYS")
+    if VACATION_LAST_HOME_DAY < VACATION_FIRST_DAY:
+        raise ValueError("VACATION_LAST_HOME_DAY must be on or after VACATION_FIRST_DAY")
+    if MIN_TRIP_LENGTH_DAYS < 1 or MAX_TRIP_LENGTH_DAYS < MIN_TRIP_LENGTH_DAYS:
+        raise ValueError("MIN_TRIP_DAYS / MAX_TRIP_DAYS are invalid")
+    last_outbound = VACATION_LAST_HOME_DAY - timedelta(days=MIN_TRIP_LENGTH_DAYS)
+    if last_outbound < VACATION_FIRST_DAY:
+        raise ValueError(
+            "No hay rango de salidas posible: ampliá VACATION_LAST_HOME_DAY o bajá MIN_TRIP_DAYS."
+        )
+    OUTBOUND_DEPART_START = VACATION_FIRST_DAY
+    OUTBOUND_DEPART_END = last_outbound
+    RETURN_ARRIVAL_HOME_START = VACATION_FIRST_DAY
+    RETURN_ARRIVAL_HOME_END = VACATION_LAST_HOME_DAY
+else:
+    OUTBOUND_DEPART_START = parse_ymd("OUTBOUND_DEPART_START")
+    OUTBOUND_DEPART_END = parse_ymd("OUTBOUND_DEPART_END")
+    RETURN_DEPART_DEST_START = parse_ymd("RETURN_DEPART_DEST_START")
+    RETURN_DEPART_DEST_END = parse_ymd("RETURN_DEPART_DEST_END")
+    if OUTBOUND_DEPART_END < OUTBOUND_DEPART_START:
+        raise ValueError("OUTBOUND_DEPART_END must be on or after OUTBOUND_DEPART_START")
+    if RETURN_DEPART_DEST_END < RETURN_DEPART_DEST_START:
+        raise ValueError("RETURN_DEPART_DEST_END must be on or after RETURN_DEPART_DEST_START")
+    # Post-filtro in-notebook: ventana amplia; filtrá por fechas reales en Spark si hace falta.
+    RETURN_ARRIVAL_HOME_START = date(1970, 1, 1)
+    RETURN_ARRIVAL_HOME_END = date(2100, 12, 31)
+    MIN_TRIP_LENGTH_DAYS = 1
+    MAX_TRIP_LENGTH_DAYS = 366
 
 ADULTS = _w_int("ADULTS")
 SEAT_TYPE = getattr(SeatType, _w_get("SEAT_TYPE"))
-MAX_STOPS = getattr(MaxStops, _w_get("MAX_STOPS"))
 SORT_BY = getattr(SortBy, _w_get("SORT_BY"))
 EXCLUDE_BASIC_ECONOMY = _w_get("EXCLUDE_BASIC_ECONOMY").lower() in ("1", "true", "yes")
-TOP_RESULTS_PER_SEARCH = _w_int("TOP_RESULTS_PER_SEARCH")
-SHOW_ALL_API_RESULTS = _w_get("SHOW_ALL_API_RESULTS").lower() in ("1", "true", "yes")
 APPLY_TRIP_WINDOW_FILTERS = _w_get("APPLY_TRIP_WINDOW_FILTERS").lower() in ("1", "true", "yes")
-RT_RECURSION_TOP_N = _w_int("RT_RECURSION_TOP_N")
 
 # COMMAND ----------
 # --- Validation (fail fast) ---
@@ -225,14 +250,10 @@ RT_RECURSION_TOP_N = _w_int("RT_RECURSION_TOP_N")
 if AIRPORT_ORIGIN == AIRPORT_DEST:
     raise ValueError("ORIGIN_AIRPORT and DESTINATION_AIRPORT must be different")
 
-if OUTBOUND_DEPART_END < OUTBOUND_DEPART_START:
-    raise ValueError("OUTBOUND_DEPART_END must be on or after OUTBOUND_DEPART_START")
-if RETURN_ARRIVAL_HOME_END < RETURN_ARRIVAL_HOME_START:
+if SEARCH_MODE == "VACATION_WINDOW" and RETURN_ARRIVAL_HOME_END < RETURN_ARRIVAL_HOME_START:
     raise ValueError("RETURN_ARRIVAL_HOME_END must be on or after RETURN_ARRIVAL_HOME_START")
-if MIN_TRIP_LENGTH_DAYS < 1 or MAX_TRIP_LENGTH_DAYS < MIN_TRIP_LENGTH_DAYS:
-    raise ValueError("MIN_TRIP_LENGTH_DAYS / MAX_TRIP_LENGTH_DAYS are invalid")
-if MAX_API_CALLS < 1:
-    raise ValueError("MAX_API_CALLS must be >= 1")
+if MAX_SEARCH_PAIRS < 1:
+    raise ValueError("MAX_SEARCH_PAIRS (constant) must be >= 1")
 if MIN_DELAY_SEC <= 0 or MAX_DELAY_SEC <= 0 or MAX_DELAY_SEC < MIN_DELAY_SEC:
     raise ValueError("MIN_DELAY_SEC / MAX_DELAY_SEC must be positive and MIN <= MAX")
 if MAX_RETRIES < 1:
@@ -240,7 +261,7 @@ if MAX_RETRIES < 1:
 if RATE_LIMIT_COOLDOWN_SEC < 0:
     raise ValueError("RATE_LIMIT_COOLDOWN_SEC must be >= 0")
 if TOP_RESULTS_PER_SEARCH < 1 or TOP_RESULTS_PER_SEARCH > 200:
-    raise ValueError("TOP_RESULTS_PER_SEARCH must be between 1 and 200")
+    raise ValueError("TOP_RESULTS_PER_SEARCH (constant) must be between 1 and 200")
 if RT_RECURSION_TOP_N < 1 or RT_RECURSION_TOP_N > 30:
     raise ValueError("RT_RECURSION_TOP_N must be between 1 and 30 (each step adds Google POSTs)")
 
@@ -259,8 +280,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("tpa_lax_search")
 
-if MAX_API_CALLS > 500:
-    log.warning("MAX_API_CALLS=%d is very high; consider lowering to reduce runtime.", MAX_API_CALLS)
+if MAX_SEARCH_PAIRS > 500:
+    log.warning("MAX_SEARCH_PAIRS=%d is high; raises 429 risk and runtime.", MAX_SEARCH_PAIRS)
 
 if SHOW_ALL_API_RESULTS and TOP_RESULTS_PER_SEARCH > 50:
     log.warning(
@@ -271,8 +292,8 @@ if SHOW_ALL_API_RESULTS and TOP_RESULTS_PER_SEARCH > 50:
 # COMMAND ----------
 # --- Candidate (outbound_date, return_depart_date) pairs ---
 
-# Días extra tras `return_depart_dest` para modelar “llegada a casa” (vuelos largos / conexiones).
-PAIR_HOME_ARRIVAL_SLACK_DAYS = 2
+# En DEST_RETURN_DATES, descarta pares con demasiados días entre salida de ida y regreso desde destino.
+MAX_OD_RD_SPAN_DAYS = 90
 
 
 def daterange(d0: date, d1: date) -> Iterable[date]:
@@ -351,48 +372,81 @@ def build_search_pairs(
             dropped,
             len(pairs),
         )
-    if len(pairs) > MAX_API_CALLS:
+    if len(pairs) > MAX_SEARCH_PAIRS:
         log.warning(
-            "Truncating filtered pairs from %d to MAX_API_CALLS=%d (raise cap or narrow windows).",
+            "Truncating filtered pairs from %d to MAX_SEARCH_PAIRS=%d (raise constant or narrow windows).",
             len(pairs),
-            MAX_API_CALLS,
+            MAX_SEARCH_PAIRS,
         )
-        pairs = pairs[:MAX_API_CALLS]
+        pairs = pairs[:MAX_SEARCH_PAIRS]
     return pairs, n_uniq_before_filter
 
 
-PAIRS, _N_PAIRS_BEFORE_PRE_FILTER = build_search_pairs(
-    OUTBOUND_DEPART_START,
-    OUTBOUND_DEPART_END,
-    MIN_TRIP_LENGTH_DAYS,
-    MAX_TRIP_LENGTH_DAYS,
-    RETURN_ARRIVAL_HOME_START,
-    RETURN_ARRIVAL_HOME_END,
-    PAIR_HOME_ARRIVAL_SLACK_DAYS,
-)
+def build_pairs_dest_return_dates(
+    out_start: date,
+    out_end: date,
+    ret_start: date,
+    ret_end: date,
+    max_pairs: int,
+    max_span_days: int,
+) -> tuple[list[tuple[date, date]], int]:
+    """Cartesiano: cada salida de ida (origen) × cada regreso desde destino; requiere ``od <= rd`` y span razonable."""
+    raw_pairs: list[tuple[date, date]] = []
+    for od in daterange(out_start, out_end):
+        for rd in daterange(ret_start, ret_end):
+            if od <= rd and (rd - od).days <= max_span_days:
+                raw_pairs.append((od, rd))
+    uniq_raw = list(dict.fromkeys(raw_pairs))
+    n_before = len(uniq_raw)
+    pairs = uniq_raw
+    if len(pairs) > max_pairs:
+        log.warning(
+            "Truncating DEST_RETURN_DATES pairs from %d to MAX_SEARCH_PAIRS=%d.",
+            len(pairs),
+            max_pairs,
+        )
+        pairs = pairs[:max_pairs]
+    return pairs, n_before
+
+
+if SEARCH_MODE == "VACATION_WINDOW":
+    PAIRS, _N_PAIRS_BEFORE_PRE_FILTER = build_search_pairs(
+        OUTBOUND_DEPART_START,
+        OUTBOUND_DEPART_END,
+        MIN_TRIP_LENGTH_DAYS,
+        MAX_TRIP_LENGTH_DAYS,
+        RETURN_ARRIVAL_HOME_START,
+        RETURN_ARRIVAL_HOME_END,
+        PAIR_HOME_ARRIVAL_SLACK_DAYS,
+    )
+else:
+    PAIRS, _N_PAIRS_BEFORE_PRE_FILTER = build_pairs_dest_return_dates(
+        OUTBOUND_DEPART_START,
+        OUTBOUND_DEPART_END,
+        RETURN_DEPART_DEST_START,
+        RETURN_DEPART_DEST_END,
+        MAX_SEARCH_PAIRS,
+        MAX_OD_RD_SPAN_DAYS,
+    )
+
 if not PAIRS:
     raise ValueError(
-        "No quedó ningún par (ida, regreso) tras el pre-filtro. Ensancha RETURN_ARRIVAL_HOME_* o MIN/MAX_TRIP_LENGTH_DAYS, "
-        "o acorta el rango de salida de ida."
+        "No quedó ningún par (ida, regreso). Revisá fechas, SEARCH_MODE, o ampliá ventanas / MAX_SEARCH_PAIRS en constantes."
     )
 
 _approx_posts = len(PAIRS) * (1 + RT_RECURSION_TOP_N)
 _out_days = (OUTBOUND_DEPART_END - OUTBOUND_DEPART_START).days + 1
-_span_count = MAX_TRIP_LENGTH_DAYS - MIN_TRIP_LENGTH_DAYS + 1
 log.info(
-    "Prepared %d (outbound, return_depart) pairs (%d únicos antes del pre-filtro) — ≈ %d outbound day(s) × %d span(s) "
-    "en grilla; MIN..MAX_TRIP_LENGTH_DAYS=%d..%d; ventana llegada a casa %s..%s; cada par ≈ 1 + %d POSTs. "
-    "Cota ≈ %d POSTs.",
+    "SEARCH_MODE=%s: %d (outbound, return_depart) pairs (raw/pre-filter count=%d); "
+    "outbound-day span=%d; home window %s..%s; ~%d POSTs (~1+%d per pair).",
+    SEARCH_MODE,
     len(PAIRS),
     _N_PAIRS_BEFORE_PRE_FILTER,
     _out_days,
-    _span_count,
-    MIN_TRIP_LENGTH_DAYS,
-    MAX_TRIP_LENGTH_DAYS,
     RETURN_ARRIVAL_HOME_START.isoformat(),
     RETURN_ARRIVAL_HOME_END.isoformat(),
-    RT_RECURSION_TOP_N,
     _approx_posts,
+    RT_RECURSION_TOP_N,
 )
 
 # Vista previa explícita (antes de cualquier llamada a la API)
@@ -407,6 +461,7 @@ for _i, (_od, _rd) in enumerate(PAIRS, start=1):
     _preview_rows.append(
         Row(
             n=_i,
+            search_mode=SEARCH_MODE,
             desde_ida_origen=_od.isoformat(),
             hasta_regreso_desde_dest=_rd.isoformat(),
             duracion_calendario_dias=(_rd - _od).days,
@@ -414,10 +469,20 @@ for _i, (_od, _rd) in enumerate(PAIRS, start=1):
             llegada_casa_plausible_hasta=_oh.isoformat(),
         )
     )
+if SEARCH_MODE == "VACATION_WINDOW":
+    _plan_extra = (
+        f"Vacaciones: primera salida {OUTBOUND_DEPART_START}, última llegada a casa {RETURN_ARRIVAL_HOME_END}; "
+        f"duración permitida {MIN_TRIP_LENGTH_DAYS}…{MAX_TRIP_LENGTH_DAYS} días."
+    )
+else:
+    _plan_extra = (
+        f"Fechas fijas: ida desde origen {OUTBOUND_DEPART_START}…{OUTBOUND_DEPART_END}, "
+        f"regreso desde destino {RETURN_DEPART_DEST_START}…{RETURN_DEPART_DEST_END} "
+        f"(cartesiano; span máx. {MAX_OD_RD_SPAN_DAYS} días)."
+    )
 print(
-    f"\nPlan de búsqueda: {len(PAIRS)} llamada(s) a la API (una por fila). "
-    f"Ventana llegada a casa: {RETURN_ARRIVAL_HOME_START} … {RETURN_ARRIVAL_HOME_END}. "
-    f"Duración viaje (días calendario salida ida → llegada casa): {MIN_TRIP_LENGTH_DAYS}…{MAX_TRIP_LENGTH_DAYS}.\n",
+    f"\nPlan de búsqueda ({SEARCH_MODE}): {len(PAIRS)} llamada(s) a la API (una por fila). "
+    f"{_plan_extra}\n",
     flush=True,
 )
 display(spark.createDataFrame(_preview_rows))  # noqa: F821
@@ -688,8 +753,12 @@ for idx, (od, rd) in enumerate(PAIRS, start=1):
         f"BÚSQUEDA {idx}/{len(PAIRS)}  |  {AIRPORT_ORIGIN.name} → {AIRPORT_DEST.name}  (ida y vuelta)\n"
         f"  · Salida de ida desde {AIRPORT_ORIGIN.name} (fecha en la query):  {od.isoformat()}\n"
         f"  · Vuelo de regreso **desde** {AIRPORT_DEST.name} (fecha en la query): {rd.isoformat()}\n"
-        f"  · Días calendario entre esas dos fechas de trayecto: {span} "
-        f"(MIN/MAX trip permitidos: {MIN_TRIP_LENGTH_DAYS}…{MAX_TRIP_LENGTH_DAYS})\n"
+        f"  · Días calendario entre esas dos fechas de trayecto: {span}"
+        + (
+            f" (MIN/MAX trip: {MIN_TRIP_LENGTH_DAYS}…{MAX_TRIP_LENGTH_DAYS})\n"
+            if SEARCH_MODE == "VACATION_WINDOW"
+            else " (modo fechas: acotá duración o aerolínea en Spark si hace falta)\n"
+        )
         f"{'=' * 72}",
         flush=True,
     )
@@ -825,12 +894,16 @@ if failure_rows:
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ### Parameters (widgets)
-# MAGIC - **Airports:** **text** `ORIGIN_AIRPORT` and `DESTINATION_AIRPORT` — **3-letter IATA** (e.g. `TPA`, `LAX`). Must exist in `fli.models.Airport`.
-# MAGIC - **Volume:** **dropdown** `TOP_RESULTS_PER_SEARCH` (p. ej. 30) = N opciones **más baratas** **después** de la API (orden por precio); **no** controla cuántos POST hace Google. **dropdown** `RT_RECURSION_TOP_N` = argumento `top_n` de `fli` en RT (**≈ 1 + top_n POSTs por par de fechas**); subirlo mucho multiplica llamadas. **dropdown** `SHOW_ALL_API_RESULTS` (`false` ≈ ~30 filas API, `true` = más resultados, más lento/429). **dropdown** `APPLY_TRIP_WINDOW_FILTERS`: si `false`, se vuelcan las filas y se usa **`matches_trip_constraints`** + fechas en Spark.
-# MAGIC - **Dates** (`OUTBOUND_DEPART_*`, `RETURN_ARRIVAL_HOME_*`): **text** widgets, **`YYYYMMDD`**. La ventana **llegada a casa** acota los pares **antes** de la API (junto con MIN/MAX días de viaje); ver tabla “Plan de búsqueda” y columnas `llegada_casa_plausible_*`.
-# MAGIC - **Trip length / caps**: **dropdowns** for `MIN_TRIP_LENGTH_DAYS`, `MAX_TRIP_LENGTH_DAYS`, `MAX_API_CALLS`, `MAX_RETRIES`, `ADULTS`.
-# MAGIC - **Delays**: **text** `MIN_DELAY_SEC`, `MAX_DELAY_SEC` (segundos, jitter **entre cada par**; si hay ≤8 pares se escala ~×0.35 para no multiplicar 50s × pocos intentos).
-# MAGIC - **429 cool-down**: **dropdown** `RATE_LIMIT_COOLDOWN_SEC` — extra sleep after a fully failed query whose error mentions `429`.
-# MAGIC - **Search**: **dropdowns** `SEAT_TYPE`, `MAX_STOPS`, `SORT_BY`, `EXCLUDE_BASIC_ECONOMY` (`true` / `false`).
-# MAGIC Widgets are created automatically on first run; adjust values in the UI then **Run all** from the read/validation cell downward.
+# MAGIC ### Widgets (solo lo operativo)
+# MAGIC - **`SEARCH_MODE`:** `VACATION_WINDOW` | `DEST_RETURN_DATES`.
+# MAGIC - **`VACATION_WINDOW`:** `VACATION_FIRST_DAY`, `VACATION_LAST_HOME_DAY` (**YYYYMMDD**), `MIN_TRIP_DAYS`, `MAX_TRIP_DAYS`. Primera salida posible = primera fecha; última **llegada a casa** = última fecha; se generan salidas de ida hasta poder cumplir duración mínima y llegar a tiempo.
+# MAGIC - **`DEST_RETURN_DATES`:** `OUTBOUND_DEPART_START`/`END`, `RETURN_DEPART_DEST_START`/`END` (**YYYYMMDD**). Producto cartesiano (cada ida × cada regreso desde destino) con `od <= rd` y span máx. fijo en código (`MAX_OD_RD_SPAN_DAYS`).
+# MAGIC - **Aeropuertos:** `ORIGIN_AIRPORT`, `DESTINATION_AIRPORT` (IATA 3 letras, enum `fli.models.Airport`).
+# MAGIC - **Cabina / orden:** `SEAT_TYPE`, `SORT_BY` (recomendado `BEST` para no sesgar todo a ULCC), `EXCLUDE_BASIC_ECONOMY`, `ADULTS`.
+# MAGIC - **`APPLY_TRIP_WINDOW_FILTERS`:** si `true`, filtra filas in-notebook; si `false`, usá Spark (p. ej. excluir Frontier con `~F.col(...).contains("Frontier")`).
+# MAGIC
+# MAGIC ### Constantes (celda “Tunables”, sin widget)
+# MAGIC `MAX_SEARCH_PAIRS`, `TOP_RESULTS_PER_SEARCH`, `RT_RECURSION_TOP_N`, `SHOW_ALL_API_RESULTS`, delays, retries,
+# MAGIC `RATE_LIMIT_COOLDOWN_SEC`, `MAX_OD_RD_SPAN_DAYS`, `PAIR_HOME_ARRIVAL_SLACK_DAYS`, `MAX_STOPS`.
+# MAGIC
+# MAGIC Primera ejecución crea widgets; cambiá valores y **Run all** desde la celda de lectura/validación hacia abajo.
